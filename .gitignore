@@ -1,0 +1,15 @@
+__pycache__/
+*.pyc
+.venv/
+.env
+.DS_Store
+.idea/
+.vscode/
+
+# Data and models
+training/raw_data/*
+!training/raw_data/.gitkeep
+models/*.pkl
+
+# Streamlit
+.streamlit/
