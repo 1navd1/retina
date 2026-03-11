@@ -1,7 +1,6 @@
 import os
 import sys
 import time
-from collections import deque
 
 import cv2
 import joblib
@@ -14,13 +13,33 @@ import folium
 # Ensure utils is importable when running from project root
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 
-from utils.feature_extractor import extract_features
+from utils.feature_extractor import (
+    append_signal_sample,
+    center_roi,
+    extract_features,
+    init_signal_buffer,
+    mean_green_from_roi,
+)
 from utils.hospital_finder import get_nearby_hospitals
 from utils.signal_processor import apply_filter
 
 
 APP_TITLE = "Retina-Vitals"
 MODEL_PATH = os.path.join("models", "bp_predictor.pkl")
+VITAL_THRESHOLDS = {
+    "bp": {
+        "warning": {"sbp_high": 130, "dbp_high": 85},
+        "critical": {"sbp_high": 140, "dbp_high": 90},
+    },
+    "hr": {
+        "warning": {"high": 100, "low": 55},
+        "critical": {"high": 120, "low": 45},
+    },
+    "hb": {
+        "warning": {"low": 10.0},
+        "critical": {"low": 8.0},
+    },
+}
 
 
 def try_load_model(path: str):
@@ -32,8 +51,86 @@ def try_load_model(path: str):
         return None
 
 
+def estimate_hb(mean_val: float, std_dev: float) -> float:
+    """Return a demo Hb estimate derived from camera signal statistics."""
+    hb = 8.0 + (mean_val / 255.0) * 8.0 + (std_dev * 0.2)
+    return float(np.clip(hb, 7.0, 18.0))
+
+
+def triage_patient(predictions: dict) -> str:
+    """Return triage label from vital predictions: NORMAL, WARNING, EMERGENCY."""
+    sbp = float(predictions.get("sbp", 0.0))
+    dbp = float(predictions.get("dbp", 0.0))
+    hr = float(predictions.get("hr", 0.0))
+    hb = float(predictions.get("hb", 0.0))
+
+    bp_critical = (
+        sbp > VITAL_THRESHOLDS["bp"]["critical"]["sbp_high"]
+        or dbp > VITAL_THRESHOLDS["bp"]["critical"]["dbp_high"]
+    )
+    hr_critical = (
+        hr > VITAL_THRESHOLDS["hr"]["critical"]["high"]
+        or hr < VITAL_THRESHOLDS["hr"]["critical"]["low"]
+    )
+    hb_critical = hb < VITAL_THRESHOLDS["hb"]["critical"]["low"]
+    if bp_critical or hr_critical or hb_critical:
+        return "EMERGENCY"
+
+    bp_warning = (
+        sbp > VITAL_THRESHOLDS["bp"]["warning"]["sbp_high"]
+        or dbp > VITAL_THRESHOLDS["bp"]["warning"]["dbp_high"]
+    )
+    hr_warning = (
+        hr > VITAL_THRESHOLDS["hr"]["warning"]["high"]
+        or hr < VITAL_THRESHOLDS["hr"]["warning"]["low"]
+    )
+    hb_warning = hb < VITAL_THRESHOLDS["hb"]["warning"]["low"]
+    if bp_warning or hr_warning or hb_warning:
+        return "WARNING"
+
+    return "NORMAL"
+
+
+def render_hospital_map(lat: float, lon: float, radius_m: int):
+    m = folium.Map(location=[lat, lon], zoom_start=13)
+    folium.Marker(
+        location=[lat, lon],
+        popup="Your Location",
+        icon=folium.Icon(color="blue", icon="user"),
+    ).add_to(m)
+    hospitals = get_nearby_hospitals(lat, lon, radius_m=radius_m)
+    if not hospitals:
+        st.info("No hospitals found (or Overpass API unavailable).")
+    for hospital in hospitals:
+        folium.Marker(
+            location=[hospital["lat"], hospital["lon"]],
+            popup=f'{hospital["name"]} ({hospital["distance_km"]:.1f} km)',
+            icon=folium.Icon(color="red", icon="plus-sign"),
+        ).add_to(m)
+    st_folium(m, height=350)
+
+
+def render_results_card(sbp: float, dbp: float, hr: float, hb: float, triage: str):
+    emergency = triage == "EMERGENCY"
+    accent = "#b91c1c" if emergency else "#166534"
+    bg = "#fee2e2" if emergency else "#dcfce7"
+    border = "#ef4444" if emergency else "#22c55e"
+    st.markdown(
+        f"""
+        <div style="border:2px solid {border}; background:{bg}; border-radius:14px; padding:18px;">
+            <div style="font-size:30px; font-weight:800; color:{accent};">Final Output</div>
+            <div style="font-size:44px; font-weight:800; color:{accent};">BP: {sbp:.0f}/{dbp:.0f}</div>
+            <div style="font-size:44px; font-weight:800; color:{accent};">HR: {hr:.0f} bpm</div>
+            <div style="font-size:44px; font-weight:800; color:{accent};">Hb: {hb:.1f} g/dL</div>
+            <div style="font-size:24px; font-weight:700; color:{accent}; margin-top:8px;">Triage: {triage}</div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
 def main():
-    st.set_page_config(page_title=APP_TITLE, layout="centered")
+    st.set_page_config(page_title=APP_TITLE, layout="wide")
     st.title(APP_TITLE)
     st.write("Contactless pulse estimation demo using the green channel.")
 
@@ -60,12 +157,17 @@ def main():
 
     run = st.checkbox("Run Camera", key="run_camera")
     frame_window = st.image([])
+    st.caption("Live PPG Signal (Green intensity over time)")
     chart_placeholder = st.empty()
     status_placeholder = st.empty()
+    result_placeholder = st.empty()
+    advice_placeholder = st.empty()
+    map_placeholder = st.empty()
 
-    # Signal buffer keeps the most recent N samples
-    buffer_size = 200
-    signal_buffer = deque(maxlen=buffer_size)
+    # Keep the latest 30 seconds of signal samples for real-time plotting.
+    sampling_rate_hz = 30
+    signal_buffer = init_signal_buffer(fs=sampling_rate_hz, duration_sec=30)
+    min_processing_samples = 200
 
     if run:
         camera = cv2.VideoCapture(0)
@@ -73,7 +175,7 @@ def main():
             st.error("Unable to access webcam (index 0).")
             return
 
-        fs = 30  # assumed frame rate (Hz)
+        fs = sampling_rate_hz  # assumed frame rate (Hz)
 
         try:
             while True:
@@ -84,22 +186,18 @@ def main():
                     status_placeholder.error("Camera frame not available.")
                     break
 
-                # Define ROI (center square)
-                h, w = frame.shape[:2]
-                size = min(h, w) // 3
-                x0 = w // 2 - size // 2
-                y0 = h // 2 - size // 2
-                roi = frame[y0 : y0 + size, x0 : x0 + size]
-
-                # Extract green channel intensity
-                g_val = float(np.mean(roi[:, :, 1]))
-                signal_buffer.append(g_val)
+                # Center ROI (100x100) and mean green-channel extraction.
+                x0, y0, x1, y1 = center_roi(frame, box_size=100)
+                g_val = mean_green_from_roi(frame, (x0, y0, x1, y1))
+                append_signal_sample(signal_buffer, g_val)
+                cv2.rectangle(frame, (x0, y0), (x1, y1), (0, 255, 0), 2)
 
                 # Render frame
                 frame_window.image(frame, channels="BGR")
+                chart_placeholder.line_chart(np.array(signal_buffer, dtype=np.float32))
 
-                # Process only when buffer is full
-                if len(signal_buffer) == buffer_size:
+                # Process once we have a stable minimum number of samples.
+                if len(signal_buffer) >= min_processing_samples:
                     raw_sig = np.array(signal_buffer, dtype=np.float32)
                     clean_sig = apply_filter(raw_sig, 0.5, 4.0, fs)
 
@@ -118,25 +216,28 @@ def main():
                             prediction = model.predict([[hr, std_dev, mean_val]])
                             sbp = float(prediction[0][0])
                             dbp = float(prediction[0][1])
-                            st.success(f"Predicted BP: {sbp:.0f}/{dbp:.0f}")
-                            if sbp > 140 or dbp > 90:
-                                st.warning("High Blood Pressure Detected.")
-                                st.info("Advice: Reduce salt intake, rest, and consult a clinician.")
-                                m = folium.Map(location=[loc_lat, loc_lon], zoom_start=13)
-                                hospitals = get_nearby_hospitals(loc_lat, loc_lon, radius_m=radius_m)
-                                if not hospitals:
-                                    st.info("No hospitals found (or Overpass API unavailable).")
-                                for h in hospitals:
-                                    folium.Marker(
-                                        location=[h["lat"], h["lon"]],
-                                        popup=f'{h[\"name\"]} ({h[\"distance_km\"]:.1f} km)',
-                                        icon=folium.Icon(color="red", icon="plus-sign"),
-                                    ).add_to(m)
-                                st_folium(m, height=350)
+                            hb = estimate_hb(mean_val, std_dev)
+                            triage = triage_patient({"sbp": sbp, "dbp": dbp, "hr": hr, "hb": hb})
+
+                            with result_placeholder.container():
+                                render_results_card(sbp, dbp, hr, hb, triage)
+
+                            with advice_placeholder.container():
+                                if triage == "EMERGENCY":
+                                    st.error("Please visit the nearest facility immediately.")
+                                elif triage == "WARNING":
+                                    st.warning("Health risk detected. Rest and consult a clinician soon.")
+                                else:
+                                    st.success("Vitals are in a relatively stable range.")
+
+                            if triage == "EMERGENCY":
+                                with map_placeholder.container():
+                                    render_hospital_map(loc_lat, loc_lon, radius_m)
+                            else:
+                                map_placeholder.empty()
                         else:
                             st.info("Prediction disabled (no model loaded).")
 
-                        chart_placeholder.line_chart(clean_sig)
                     else:
                         status_placeholder.info("Waiting for stable peaks...")
 
