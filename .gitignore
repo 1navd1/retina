@@ -7,6 +7,7 @@ __pycache__/
 .vscode/
 
 # Data and models
+dataset/
 training/raw_data/*
 !training/raw_data/.gitkeep
 models/*.pkl
