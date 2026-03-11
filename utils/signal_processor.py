@@ -1,54 +1,48 @@
-"""Signal processing utilities for PPG-like waveforms."""
+"""Signal processing utilities for PPG-like signals."""
 
-from typing import Tuple
+from typing import Iterable
 
 import numpy as np
-from scipy.signal import butter, lfilter
+from scipy.signal import butter, detrend, filtfilt
+
+DEFAULT_FS = 30.0
+LOW_CUT_HZ = 0.5
+HIGH_CUT_HZ = 4.0
+FILTER_ORDER = 3
 
 
-def butter_bandpass(lowcut: float, highcut: float, fs: float, order: int = 3) -> Tuple[np.ndarray, np.ndarray]:
+def _bandpass_filter(signal: np.ndarray, fs: float) -> np.ndarray:
+    nyquist = 0.5 * fs
+    low = LOW_CUT_HZ / nyquist
+    high = HIGH_CUT_HZ / nyquist
+    if not 0 < low < high < 1:
+        raise ValueError("Invalid bandpass frequencies for the given sampling rate.")
+    b, a = butter(FILTER_ORDER, [low, high], btype="bandpass")
+    return filtfilt(b, a, signal)
+
+
+def _remove_trend(signal: np.ndarray) -> np.ndarray:
+    return detrend(signal, type="linear")
+
+
+def process_signal(raw_signal: Iterable[float], fs: float = DEFAULT_FS) -> np.ndarray:
     """
-    Create Butterworth bandpass filter coefficients.
+    Clean a raw green-channel signal using detrending + bandpass filtering.
 
     Args:
-        lowcut: Low cutoff frequency (Hz).
-        highcut: High cutoff frequency (Hz).
-        fs: Sampling rate (Hz).
-        order: Filter order.
+        raw_signal: Iterable of raw samples.
+        fs: Sampling rate in Hz.
 
     Returns:
-        (b, a) filter coefficients.
+        Filtered 1D NumPy array.
     """
     if fs <= 0:
         raise ValueError("Sampling rate fs must be positive.")
-    if not (0 < lowcut < highcut < fs / 2):
-        raise ValueError("Cutoffs must satisfy 0 < lowcut < highcut < fs/2.")
-    if order <= 0:
-        raise ValueError("Filter order must be positive.")
 
-    nyq = 0.5 * fs
-    low = lowcut / nyq
-    high = highcut / nyq
-    b, a = butter(order, [low, high], btype="band")
-    return b, a
+    signal = np.asarray(list(raw_signal), dtype=float)
+    if signal.size < max(15, FILTER_ORDER * 3):
+        raise ValueError("Signal is too short for filtering.")
 
-
-def apply_filter(data: np.ndarray, lowcut: float, highcut: float, fs: float, order: int = 3) -> np.ndarray:
-    """
-    Apply Butterworth bandpass filter to the signal.
-
-    Args:
-        data: 1D signal array.
-        lowcut: Low cutoff frequency (Hz).
-        highcut: High cutoff frequency (Hz).
-        fs: Sampling rate (Hz).
-        order: Filter order.
-
-    Returns:
-        Filtered signal array.
-    """
-    if data is None or len(data) == 0:
-        raise ValueError("Data must be a non-empty 1D array.")
-    b, a = butter_bandpass(lowcut, highcut, fs, order=order)
-    y = lfilter(b, a, data)
-    return y
+    signal = signal - np.mean(signal)
+    signal = _remove_trend(signal)
+    return _bandpass_filter(signal, fs)

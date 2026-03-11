@@ -4,6 +4,7 @@ numpy
 scipy
 scikit-learn
 pandas
+h5py
 folium
 streamlit-folium
 streamlit-geolocation
