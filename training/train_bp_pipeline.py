@@ -6,18 +6,22 @@ import io
 import os
 import re
 import zipfile
+import sys
 
 import joblib
 import numpy as np
 import pandas as pd
 import scipy.io as sio
-from scipy.stats import kurtosis
 from sklearn.ensemble import RandomForestRegressor
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import StandardScaler
 from typing import Optional
 
 ROOT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.append(ROOT_DIR)
+
+from utils.feature_extractor import extract_ppg_features
+from utils.signal_processor import process_signal
 
 DEFAULT_ARCHIVE_PATH = os.path.join(ROOT_DIR, "archive.zip")
 DEFAULT_MODEL_OUT_PATH = os.path.join(ROOT_DIR, "models", "bp_predictor.pkl")
@@ -38,6 +42,7 @@ def parse_args():
     parser.add_argument("--hb-key", default=None, help="HDF5 dataset key for Hb labels.")
     parser.add_argument("--ppg-channel", type=int, default=0, help="MAT channel index for PPG.")
     parser.add_argument("--bp-channel", type=int, default=1, help="MAT channel index for ABP.")
+    parser.add_argument("--fs", type=float, default=30.0, help="Sampling rate (Hz).")
     parser.add_argument("--waveform-col", default=None, help="Column containing waveform arrays.")
     parser.add_argument("--id-col", default=None, help="Record/subject identifier for long format.")
     parser.add_argument("--sbp-col", default=None, help="Systolic BP column name.")
@@ -171,7 +176,7 @@ def load_hdf5_arrays(
         return ppg, labels
 
 
-def build_samples_from_waveforms(waveforms: np.ndarray, labels: np.ndarray):
+def build_samples_from_waveforms(waveforms: np.ndarray, labels: np.ndarray, fs: float):
     if waveforms is None or labels is None:
         raise ValueError("Waveforms and labels are required.")
 
@@ -185,7 +190,7 @@ def build_samples_from_waveforms(waveforms: np.ndarray, labels: np.ndarray):
 
     rows = []
     for waveform in waveforms:
-        feats = compute_features(waveform)
+        feats = compute_features(waveform, fs)
         if feats is None:
             continue
         rows.append(feats)
@@ -199,7 +204,7 @@ def build_samples_from_waveforms(waveforms: np.ndarray, labels: np.ndarray):
     return np.asarray(rows, dtype=float), labels
 
 
-def load_mat_dataset(dataset_dir: str, ppg_channel: int, bp_channel: int):
+def load_mat_dataset(dataset_dir: str, ppg_channel: int, bp_channel: int, fs: float):
     if not os.path.isdir(dataset_dir):
         raise FileNotFoundError(f"Dataset directory not found: {dataset_dir}")
 
@@ -244,7 +249,7 @@ def load_mat_dataset(dataset_dir: str, ppg_channel: int, bp_channel: int):
                 ppg = data[:, ppg_channel]
                 bp = data[:, bp_channel]
 
-            feats = compute_features(ppg)
+            feats = compute_features(ppg, fs)
             if feats is None:
                 continue
             rows.append(feats)
@@ -256,17 +261,14 @@ def load_mat_dataset(dataset_dir: str, ppg_channel: int, bp_channel: int):
     return np.asarray(rows, dtype=float), np.asarray(labels, dtype=float)
 
 
-def compute_features(waveform: np.ndarray):
+def compute_features(waveform: np.ndarray, fs: float):
     waveform = np.asarray(waveform, dtype=float)
     waveform = waveform[np.isfinite(waveform)]
     if waveform.size < 2:
         return None
 
-    std_dev = float(np.std(waveform))
-    kurt = float(kurtosis(waveform, fisher=False, bias=False))
-    fft_vals = np.fft.rfft(waveform - np.mean(waveform))
-    fft_power = float(np.sum(np.abs(fft_vals) ** 2) / len(fft_vals))
-    return [std_dev, kurt, fft_power]
+    clean = process_signal(waveform, fs)
+    return extract_ppg_features(clean, fs)
 
 
 def build_samples(
@@ -276,6 +278,7 @@ def build_samples(
     sbp_col: Optional[str],
     dbp_col: Optional[str],
     hb_col: Optional[str],
+    fs: float,
 ):
     df = df.copy()
     df.columns = [c.strip() for c in df.columns]
@@ -300,7 +303,7 @@ def build_samples(
                 waveform = _parse_waveform_cell(row[waveform_col])
                 if waveform is None:
                     continue
-                feats = compute_features(waveform)
+                feats = compute_features(waveform, fs)
                 if feats is None:
                     continue
                 rows.append(feats)
@@ -317,7 +320,7 @@ def build_samples(
         ppg_cols_sorted = sorted(ppg_cols, key=lambda c: int(re.findall(r"\d+", c)[0]) if re.findall(r"\d+", c) else c)
         for _, row in df.iterrows():
             waveform = row[ppg_cols_sorted].to_numpy(dtype=float)
-            feats = compute_features(waveform)
+            feats = compute_features(waveform, fs)
             if feats is None:
                 continue
             rows.append(feats)
@@ -336,7 +339,7 @@ def build_samples(
         labels = []
         for _, group in df.groupby(id_col):
             waveform = group[ppg_value_col].to_numpy(dtype=float)
-            feats = compute_features(waveform)
+            feats = compute_features(waveform, fs)
             if feats is None:
                 continue
             rows.append(feats)
@@ -359,6 +362,7 @@ def main():
             args.archive,
             ppg_channel=args.ppg_channel,
             bp_channel=args.bp_channel,
+            fs=args.fs,
         )
     elif args.archive.lower().endswith((".hdf5", ".h5")):
         waveforms, labels = load_hdf5_arrays(
@@ -369,7 +373,7 @@ def main():
             dbp_key=args.dbp_key,
             hb_key=args.hb_key,
         )
-        X, y = build_samples_from_waveforms(waveforms, labels)
+        X, y = build_samples_from_waveforms(waveforms, labels, fs=args.fs)
     else:
         df = load_tabular_dataframe(args.archive, args.member)
         X, y = build_samples(
@@ -379,6 +383,7 @@ def main():
             sbp_col=args.sbp_col,
             dbp_col=args.dbp_col,
             hb_col=args.hb_col,
+            fs=args.fs,
         )
 
     if X.size == 0:

@@ -1,10 +1,11 @@
 """Feature extraction utilities for PPG-like signals."""
 
 from collections import deque
-from typing import Deque, Dict, Tuple
+from typing import Deque, Dict, List, Tuple
 
 import numpy as np
 from scipy.signal import find_peaks
+from scipy import stats
 
 
 def center_roi(frame: np.ndarray, box_size: int = 100) -> Tuple[int, int, int, int]:
@@ -87,3 +88,28 @@ def extract_features(clean_sig: np.ndarray, fs: float) -> Dict[str, float]:
         "std_dev": std_dev,
         "mean_val": mean_val,
     }
+
+
+def extract_ppg_features(clean_sig: np.ndarray, fs: float = 30.0) -> List[float]:
+    """
+    Extract the core PPG features in a fixed order:
+    [hr_bpm, std_dev, skewness, kurtosis, mean_val]
+    """
+    if clean_sig is None or len(clean_sig) == 0:
+        raise ValueError("Signal must be a non-empty 1D array.")
+    if fs <= 0:
+        raise ValueError("Sampling rate fs must be positive.")
+
+    peaks, _ = find_peaks(clean_sig, distance=max(1, int(0.5 * fs)))
+    if len(peaks) > 1:
+        rr_intervals = np.diff(peaks) / fs
+        hr_bpm = 60.0 / np.mean(rr_intervals)
+    else:
+        hr_bpm = 0.0
+
+    std_dev = float(np.std(clean_sig))
+    skewness = float(stats.skew(clean_sig, bias=False))
+    kurtosis = float(stats.kurtosis(clean_sig, fisher=True, bias=False))
+    mean_val = float(np.mean(clean_sig))
+
+    return [float(hr_bpm), std_dev, skewness, kurtosis, mean_val]

@@ -13,7 +13,8 @@ from sklearn.model_selection import train_test_split
 ROOT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.append(ROOT_DIR)
 
-from utils.feature_extractor import extract_features
+from utils.feature_extractor import extract_ppg_features
+from utils.signal_processor import process_signal
 
 DEFAULT_RAW_DATA_PATH = os.path.join("training", "raw_data", "ppg_data.csv")
 DEFAULT_MODEL_OUT_PATH = os.path.join("models", "bp_predictor.pkl")
@@ -52,8 +53,9 @@ def build_feature_rows(
 
     for i in range(0, len(ppg) - window_size, window_size):
         segment = ppg[i : i + window_size]
-        feats = extract_features(segment, fs)
-        X.append([feats["hr_bpm"], feats["std_dev"], feats["mean_val"]])
+        clean = process_signal(segment, fs)
+        feats = extract_ppg_features(clean, fs)
+        X.append(feats)
 
         # Use the last BP values in the window as target
         y.append([sbp[i + window_size - 1], dbp[i + window_size - 1]])
